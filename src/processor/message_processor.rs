@@ -213,16 +213,10 @@ pub async fn process_message(pool: &sqlx::Pool<Postgres>, payload: &[u8]) -> any
         }
     } else if let Some(alert_name) = alert_type {
         // Detectar otras alertas -> solo trip_alerts
-        // Map alert
-        let mapped_alert = match alert_name {
-            "Power Cut" => Some("power_cut"),
-            "Jamming" => Some("jamming"),
-            "Low Battery" => Some("low_backup_battery"),
-            // Add other mappings as needed
-            _ => None,
-        };
+        // "no mapes las alartas, en su lugar, usa el valor de alert_type"
+        // "Si este viene vacio, considera k no es valida y no proceses la alerta"
 
-        if let Some(valid_alert) = mapped_alert {
+        if !alert_name.trim().is_empty() {
             // We need a trip_id to insert alert.
             // If active, use last_trip_id.
             // If inactive, we cannot insert into trip_alerts (NOT NULL constraint).
@@ -234,7 +228,7 @@ pub async fn process_message(pool: &sqlx::Pool<Postgres>, payload: &[u8]) -> any
                     .bind(timestamp)
                     .bind(lat)
                     .bind(lon)
-                    .bind(valid_alert)
+                    .bind(alert_name) // Use raw alert name
                     .bind(message.data.raw_code.as_deref().and_then(|s| s.parse::<i32>().ok()))
                     .bind(1i16)
                     .bind(&device_id_str)
@@ -242,13 +236,10 @@ pub async fn process_message(pool: &sqlx::Pool<Postgres>, payload: &[u8]) -> any
                     .execute(&mut *tx)
                     .await?;
             } else {
-                warn!("Cannot insert alert '{}' because no active trip found for device {}", valid_alert, device_id_str);
+                warn!("Cannot insert alert '{}' because no active trip found for device {}", alert_name, device_id_str);
             }
         } else {
-             // "Si no está mapeado → guardarlo como raw alert en texto (pero no como point)."
-             // But we can't insert into trip_alerts.alert_type if not in enum.
-             // We'll log it.
-             warn!("Unmapped alert '{}' for device {}", alert_name, device_id_str);
+             warn!("Empty alert type received for device {}", device_id_str);
         }
 
         // Update last point info (Siempre actualizar)
