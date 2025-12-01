@@ -3,7 +3,7 @@ use crate::db::queries;
 use sqlx::{Postgres, Row};
 use uuid::Uuid;
 use chrono::NaiveDateTime;
-use tracing::{info, warn};
+use tracing::{info, warn, error};
 
 pub async fn process_message(pool: &sqlx::Pool<Postgres>, payload: &[u8]) -> anyhow::Result<()> {
     // 1. Parse JSON
@@ -24,8 +24,9 @@ pub async fn process_message(pool: &sqlx::Pool<Postgres>, payload: &[u8]) -> any
         }
     };
 
-    info!("Processing message for device: {} {:?}\n", device_id_str, message);
-    
+    info!("Processing message for device: {} uuid: {}\n", device_id_str, message.uuid);
+
+    let message_uuid = Uuid::parse_str(&message.uuid).unwrap_or_else(|_| Uuid::new_v4());
 
     let gps_datetime_str = message.data.gps_datetime.as_deref().unwrap_or("");
     let timestamp = match NaiveDateTime::parse_from_str(gps_datetime_str, "%Y-%m-%d %H:%M:%S") {
@@ -44,13 +45,12 @@ pub async fn process_message(pool: &sqlx::Pool<Postgres>, payload: &[u8]) -> any
     let lat = message.data.latitude.unwrap_or(0.0);
     let lon = message.data.longitude.unwrap_or(0.0);
     let speed = message.data.speed.unwrap_or(0.0);
-    let heading = message.data.heading.unwrap_or(0.0);
+    // let heading = message.data.heading.unwrap_or(0.0); // Not used in current logic
 
     let alert_type = message.data.alert.as_deref();
     let alert_type_upper = alert_type.map(|s| s.to_uppercase());
     let is_engine_on = alert_type_upper.as_deref() == Some("ENGINE ON");
     let is_engine_off = alert_type_upper.as_deref() == Some("ENGINE OFF");
-    // let msg_class = message.data.msg_class.as_deref(); // Not strictly needed if we focus on alert_type and points
 
     // 3. Start Transaction
     let mut tx = pool.begin().await?;
@@ -61,7 +61,7 @@ pub async fn process_message(pool: &sqlx::Pool<Postgres>, payload: &[u8]) -> any
         .fetch_optional(&mut *tx)
         .await?;
 
-    let (last_trip_id, current_ignition_status): (Option<Uuid>, Option<bool>) = match active_trip_row {
+    let (mut last_trip_id, current_ignition_status): (Option<Uuid>, Option<bool>) = match active_trip_row {
         Some(row) => (
             row.try_get("current_trip_id").ok(),
             row.try_get("ignition_on").ok(),
@@ -69,24 +69,40 @@ pub async fn process_message(pool: &sqlx::Pool<Postgres>, payload: &[u8]) -> any
         None => (None, None),
     };
 
+    // Rule: ignition_on = true cuando hay viaje activo
     let is_trip_active = current_ignition_status.unwrap_or(false);
 
-    // 5. Evaluate Rules
-
-    // Rule 1: Engine ON -> Start Trip
-    if is_engine_on {
-        // Only start if no active trip or if we want to enforce a restart (User says: "Cuando llega una alerta... Crear un nuevo trip")
-        // But also "Para evitar: Doble creación de trips".
-        // If active_trip_id exists, we should probably check if it's stale or just log it.
-        // User says: "Si llegan dos mensajes casi al mismo tiempo... Para evitar doble creación".
-        // Since we locked the row, we are safe from race conditions.
-        // If is_trip_active is true, we ignore the Engine ON to avoid double creation.
+    // If trip is active but we don't have the ID (because it's NULL in current state), fetch it from trips table
+    if is_trip_active && last_trip_id.is_none() {
+        let open_trip_row = sqlx::query(queries::SELECT_LATEST_OPEN_TRIP)
+            .bind(&device_id_str)
+            .fetch_optional(&mut *tx)
+            .await?;
         
+        if let Some(row) = open_trip_row {
+            last_trip_id = row.try_get("trip_id").ok();
+        }
+    }
+
+    // 5. Update Current State (Always update last point info)
+    // "Siempre actualizar last_point_at, last_lat, last_lng, last_speed"
+    // Note: We use UPDATE_CURRENT_STATE_POINT for this generic update.
+    // However, if we are creating a NEW trip, we use UPDATE_CURRENT_STATE_NEW_TRIP which also sets these.
+    // If we are ENDING a trip, we use UPDATE_CURRENT_STATE_END_TRIP.
+    // So we will do specific updates inside the rules, OR a generic one if no state change?
+    // The prompt says "Detectar ENGINE_ON -> ... -> actualizar current_state".
+    // So we should probably do it as part of the specific actions to avoid double updates.
+    // BUT, for "Si es punto válido -> trip_points + actualizar current_state".
+    
+    // Let's handle the logic flow:
+
+    if is_engine_on {
+        // Detectar ENGINE_ON -> crear trip -> alert -> actualizar current_state
         if !is_trip_active {
-            // Create new trip
-            let trip_id = Uuid::parse_str(&message.uuid).unwrap_or_else(|_| Uuid::new_v4());
+            let trip_id = message_uuid; // Use message UUID as trip ID
             info!("Started new trip {} for device {}", trip_id, device_id_str);
 
+            // Create Trip
             sqlx::query(queries::INSERT_TRIP)
                 .bind(trip_id)
                 .bind(&device_id_str)
@@ -96,11 +112,11 @@ pub async fn process_message(pool: &sqlx::Pool<Postgres>, payload: &[u8]) -> any
                 .execute(&mut *tx)
                 .await?;
 
-            // Update trip_current_state
-            let message_uuid = Uuid::parse_str(&message.uuid).unwrap_or_default();
+            // Update Current State (New Trip)
+            // Sets ignition_on = true, current_trip_id = NULL
             sqlx::query(queries::UPDATE_CURRENT_STATE_NEW_TRIP)
                 .bind(&device_id_str)
-                .bind(trip_id)
+                .bind(trip_id) // This param is used for last_point logic if needed, but query sets current_trip_id=NULL
                 .bind(timestamp)
                 .bind(lat)
                 .bind(lon)
@@ -108,11 +124,8 @@ pub async fn process_message(pool: &sqlx::Pool<Postgres>, payload: &[u8]) -> any
                 .execute(&mut *tx)
                 .await?;
 
-            // Insert Alert
+            // Insert Alert (ignition_on)
             let alert_id = Uuid::new_v4();
-            // let correlation_id = ... // Removed as per user request
-            let message_uuid = Uuid::parse_str(&message.uuid).unwrap_or_default();
-
             sqlx::query(queries::INSERT_TRIP_ALERT)
                 .bind(alert_id)
                 .bind(trip_id)
@@ -126,140 +139,10 @@ pub async fn process_message(pool: &sqlx::Pool<Postgres>, payload: &[u8]) -> any
                 .bind(message_uuid)
                 .execute(&mut *tx)
                 .await?;
-
-            // Insert Point (First point of trip)
-            sqlx::query(queries::INSERT_TRIP_POINT)
-                .bind(trip_id)
-                .bind(&device_id_str)
-                .bind(timestamp)
-                .bind(lat)
-                .bind(lon)
-                .bind(speed)
-                .bind(heading)
-                .bind(true) // Ignition On
-                .bind(message_uuid)
-                .execute(&mut *tx)
-                .await?;
         } else {
             info!("Ignored Engine ON for active trip: {}", device_id_str);
-        }
-    }
-    // Rule 3: Engine Off -> End Trip
-    else if is_engine_off {
-        if is_trip_active {
-            let trip_id = last_trip_id.expect("Active trip must have an ID");
-            sqlx::query(queries::UPDATE_TRIP_END)
-                .bind(timestamp)
-                .bind(lat)
-                .bind(lon)
-                .bind(trip_id)
-                .execute(&mut *tx)
-                .await?;
-
-            // Update trip_current_state
-            let message_uuid = Uuid::parse_str(&message.uuid).unwrap_or_default();
-            sqlx::query(queries::UPDATE_CURRENT_STATE_END_TRIP)
-                .bind(&device_id_str)
-                .bind(message_uuid)
-                .bind(trip_id)
-                .execute(&mut *tx)
-                .await?;
-
-            info!("Ended trip {} for device {}", trip_id, device_id_str);
-
-            // Insert Alert
-            let alert_id = Uuid::new_v4();
-            let message_uuid = Uuid::parse_str(&message.uuid).unwrap_or_default();
-
-            sqlx::query(queries::INSERT_TRIP_ALERT)
-                .bind(alert_id)
-                .bind(trip_id)
-                .bind(timestamp)
-                .bind(lat)
-                .bind(lon)
-                .bind("ignition_off")
-                .bind(message.data.raw_code.as_deref().and_then(|s| s.parse::<i32>().ok()))
-                .bind(1i16)
-                .bind(&device_id_str)
-                .bind(message_uuid)
-                .execute(&mut *tx)
-                .await?;
-            
-            // Insert Point (Last point of trip)
-            sqlx::query(queries::INSERT_TRIP_POINT)
-                .bind(trip_id)
-                .bind(&device_id_str)
-                .bind(timestamp)
-                .bind(lat)
-                .bind(lon)
-                .bind(speed)
-                .bind(heading)
-                .bind(false) // Ignition Off
-                .bind(message_uuid)
-                .execute(&mut *tx)
-                .await?;
-        } else {
-             info!("Ignored Engine OFF for inactive trip: {}", device_id_str);
-        }
-    }
-    // Rule 2: Points and Other Alerts (During Active Trip)
-    else {
-        // If we have an active trip, we process points and other alerts
-        if is_trip_active {
-            let trip_id = last_trip_id.expect("Active trip must have an ID");
-            let message_uuid = Uuid::parse_str(&message.uuid).unwrap_or_default();
-
-            // Always insert point if valid (User says: "Siempre que llegue un punto válido")
-            // Assuming all messages here are valid points if they have lat/lon/timestamp
-            // We'll insert a point for every message that falls through here if it's part of a trip
-            
-            // Check if it's an alert
-            if let Some(alert_name) = alert_type {
-                 let mapped_alert = match alert_name {
-                    "Power Cut" => Some("power_cut"),
-                    "Jamming" => Some("jamming"),
-                    "Low Battery" => Some("low_backup_battery"),
-                    // Add other mappings as needed
-                    _ => None,
-                };
-
-                if let Some(valid_alert) = mapped_alert {
-                    let alert_id = Uuid::new_v4();
-                    sqlx::query(queries::INSERT_TRIP_ALERT)
-                        .bind(alert_id)
-                        .bind(trip_id)
-                        .bind(timestamp)
-                        .bind(lat)
-                        .bind(lon)
-                        .bind(valid_alert)
-                        .bind(message.data.raw_code.as_deref().and_then(|s| s.parse::<i32>().ok()))
-                        .bind(1i16)
-                        .bind(&device_id_str)
-                        .bind(message_uuid)
-                        .execute(&mut *tx)
-                        .await?;
-                }
-            }
-
-            // Insert Point
-            // We assume ignition is ON because we are in an active trip (unless engine status says otherwise, but usually yes)
-            let is_ignition_on = current_ignition_status.unwrap_or(true);
-
-            sqlx::query(queries::INSERT_TRIP_POINT)
-                .bind(trip_id)
-                .bind(&device_id_str)
-                .bind(timestamp)
-                .bind(lat)
-                .bind(lon)
-                .bind(speed)
-                .bind(heading)
-                .bind(is_ignition_on)
-                .bind(message_uuid)
-                .execute(&mut *tx)
-                .await?;
-
-            // Update trip_current_state
-            let message_uuid = Uuid::parse_str(&message.uuid).unwrap_or_default();
+            // Even if ignored, we should probably update last_point info?
+            // User says "Siempre actualizar...".
             sqlx::query(queries::UPDATE_CURRENT_STATE_POINT)
                 .bind(&device_id_str)
                 .bind(timestamp)
@@ -267,11 +150,148 @@ pub async fn process_message(pool: &sqlx::Pool<Postgres>, payload: &[u8]) -> any
                 .bind(lon)
                 .bind(speed)
                 .bind(message_uuid)
-                // .bind(heading) // Removed heading as it is not in trip_current_state DDL
                 .execute(&mut *tx)
                 .await?;
         }
-        // If no active trip, we do nothing (User says: "Los puntos GPS no abren ni cierran trips")
+    } else if is_engine_off {
+        // Detectar ENGINE_OFF -> cerrar trip -> alert -> limpiar current_state
+        if is_trip_active {
+            if let Some(trip_id) = last_trip_id {
+                info!("Ended trip {} for device {}", trip_id, device_id_str);
+
+                // Close Trip
+                sqlx::query(queries::UPDATE_TRIP_END)
+                    .bind(timestamp)
+                    .bind(lat)
+                    .bind(lon)
+                    .bind(trip_id)
+                    .execute(&mut *tx)
+                    .await?;
+
+                // Update Current State (End Trip)
+                // Sets ignition_on = false, current_trip_id = trip_id
+                sqlx::query(queries::UPDATE_CURRENT_STATE_END_TRIP)
+                    .bind(&device_id_str)
+                    .bind(message_uuid)
+                    .bind(trip_id)
+                    .execute(&mut *tx)
+                    .await?;
+
+                // Insert Alert (ignition_off)
+                let alert_id = Uuid::new_v4();
+                sqlx::query(queries::INSERT_TRIP_ALERT)
+                    .bind(alert_id)
+                    .bind(trip_id)
+                    .bind(timestamp)
+                    .bind(lat)
+                    .bind(lon)
+                    .bind("ignition_off")
+                    .bind(message.data.raw_code.as_deref().and_then(|s| s.parse::<i32>().ok()))
+                    .bind(1i16)
+                    .bind(&device_id_str)
+                    .bind(message_uuid)
+                    .execute(&mut *tx)
+                    .await?;
+            } else {
+                error!("Active trip detected but no trip_id found for device {}", device_id_str);
+            }
+        } else {
+             info!("Ignored Engine OFF for inactive trip: {}", device_id_str);
+             // Update last point info
+             sqlx::query(queries::UPDATE_CURRENT_STATE_POINT)
+                .bind(&device_id_str)
+                .bind(timestamp)
+                .bind(lat)
+                .bind(lon)
+                .bind(speed)
+                .bind(message_uuid)
+                .execute(&mut *tx)
+                .await?;
+        }
+    } else if let Some(alert_name) = alert_type {
+        // Detectar otras alertas -> solo trip_alerts
+        // Map alert
+        let mapped_alert = match alert_name {
+            "Power Cut" => Some("power_cut"),
+            "Jamming" => Some("jamming"),
+            "Low Battery" => Some("low_backup_battery"),
+            // Add other mappings as needed
+            _ => None,
+        };
+
+        if let Some(valid_alert) = mapped_alert {
+            // We need a trip_id to insert alert.
+            // If active, use last_trip_id.
+            // If inactive, we cannot insert into trip_alerts (NOT NULL constraint).
+            if let Some(trip_id) = last_trip_id {
+                let alert_id = Uuid::new_v4();
+                sqlx::query(queries::INSERT_TRIP_ALERT)
+                    .bind(alert_id)
+                    .bind(trip_id)
+                    .bind(timestamp)
+                    .bind(lat)
+                    .bind(lon)
+                    .bind(valid_alert)
+                    .bind(message.data.raw_code.as_deref().and_then(|s| s.parse::<i32>().ok()))
+                    .bind(1i16)
+                    .bind(&device_id_str)
+                    .bind(message_uuid)
+                    .execute(&mut *tx)
+                    .await?;
+            } else {
+                warn!("Cannot insert alert '{}' because no active trip found for device {}", valid_alert, device_id_str);
+            }
+        } else {
+             // "Si no está mapeado → guardarlo como raw alert en texto (pero no como point)."
+             // But we can't insert into trip_alerts.alert_type if not in enum.
+             // We'll log it.
+             warn!("Unmapped alert '{}' for device {}", alert_name, device_id_str);
+        }
+
+        // Update last point info (Siempre actualizar)
+        sqlx::query(queries::UPDATE_CURRENT_STATE_POINT)
+            .bind(&device_id_str)
+            .bind(timestamp)
+            .bind(lat)
+            .bind(lon)
+            .bind(speed)
+            .bind(message_uuid)
+            .execute(&mut *tx)
+            .await?;
+
+    } else {
+        // Si es punto válido -> trip_points + actualizar current_state
+        // "SOLO insertar en trip_points si: Es un mensaje sin alert... Existe un viaje activo"
+        
+        if is_trip_active {
+             if let Some(trip_id) = last_trip_id {
+                // Insert Point
+                // "trip_points nunca debe tener un campo de ignición" -> Pass None
+                sqlx::query(queries::INSERT_TRIP_POINT)
+                    .bind(trip_id)
+                    .bind(&device_id_str)
+                    .bind(timestamp)
+                    .bind(lat)
+                    .bind(lon)
+                    .bind(speed)
+                    .bind(message.data.heading.unwrap_or(0.0))
+                    .bind(None::<bool>) // Ignition On (None)
+                    .bind(message_uuid)
+                    .execute(&mut *tx)
+                    .await?;
+             }
+        }
+
+        // Update last point info (Siempre actualizar)
+        sqlx::query(queries::UPDATE_CURRENT_STATE_POINT)
+            .bind(&device_id_str)
+            .bind(timestamp)
+            .bind(lat)
+            .bind(lon)
+            .bind(speed)
+            .bind(message_uuid)
+            .execute(&mut *tx)
+            .await?;
     }
 
     tx.commit().await?;

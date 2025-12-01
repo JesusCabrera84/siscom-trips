@@ -2,6 +2,10 @@ pub const SELECT_ACTIVE_TRIP_ID: &str = r#"
 SELECT current_trip_id, ignition_on FROM trip_current_state WHERE device_id = $1 FOR UPDATE;
 "#;
 
+pub const SELECT_LATEST_OPEN_TRIP: &str = r#"
+SELECT trip_id FROM trips WHERE device_id = $1 AND end_time IS NULL ORDER BY start_time DESC LIMIT 1;
+"#;
+
 pub const INSERT_TRIP: &str = r#"
 INSERT INTO trips (trip_id, device_id, start_time, start_lat, start_lng)
 VALUES ($1, $2, $3, $4, $5);
