@@ -34,9 +34,13 @@ SET current_trip_id = $2,
 
 pub const UPDATE_CURRENT_STATE_END_TRIP: &str = r#"
 UPDATE trip_current_state
-SET current_trip_id = $3,
+SET current_trip_id = NULL,
     ignition_on = false,
     last_updated_at = NOW(),
+    last_point_at = $3,
+    last_lat = $4,
+    last_lng = $5,
+    last_speed = $6,
     last_correlation_id = $2
 WHERE device_id = $1;
 "#;
@@ -53,8 +57,8 @@ WHERE device_id = $1;
 "#;
 
 pub const INSERT_TRIP_POINT: &str = r#"
-INSERT INTO trip_points (trip_id, device_id, timestamp, lat, lng, speed, heading, ignition_on, correlation_id)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9);
+INSERT INTO trip_points (trip_id, device_id, timestamp, lat, lng, speed, heading, correlation_id)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8);
 "#;
 
 pub const INSERT_TRIP_ALERT: &str = r#"

@@ -169,11 +169,14 @@ pub async fn process_message(pool: &sqlx::Pool<Postgres>, payload: &[u8]) -> any
                     .await?;
 
                 // Update Current State (End Trip)
-                // Sets ignition_on = false, current_trip_id = trip_id
+                // Sets ignition_on = false, current_trip_id = NULL
                 sqlx::query(queries::UPDATE_CURRENT_STATE_END_TRIP)
                     .bind(&device_id_str)
                     .bind(message_uuid)
-                    .bind(trip_id)
+                    .bind(timestamp)
+                    .bind(lat)
+                    .bind(lon)
+                    .bind(speed)
                     .execute(&mut *tx)
                     .await?;
 
@@ -275,7 +278,6 @@ pub async fn process_message(pool: &sqlx::Pool<Postgres>, payload: &[u8]) -> any
                     .bind(lon)
                     .bind(speed)
                     .bind(message.data.heading.unwrap_or(0.0))
-                    .bind(None::<bool>) // Ignition On (None)
                     .bind(message_uuid)
                     .execute(&mut *tx)
                     .await?;

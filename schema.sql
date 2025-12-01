@@ -62,7 +62,6 @@ CREATE TABLE IF NOT EXISTS trip_points (
     lng float8 NOT NULL,
     speed float8 NULL,
     heading float8 NULL,
-    ignition_on bool NULL,
     correlation_id uuid NOT NULL,
     CONSTRAINT trip_points_pkey PRIMARY KEY (device_id, "timestamp", correlation_id)
 );
