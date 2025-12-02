@@ -1,0 +1,212 @@
+name: Deploy to EC2
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+env:
+  CARGO_TERM_COLOR: always
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+    
+    - name: Install rustfmt
+      run: rustup component add rustfmt
+          
+    - name: Cache dependencies
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cargo/bin/
+          ~/.cargo/registry/index/
+          ~/.cargo/registry/cache/
+          ~/.cargo/git/db/
+          target/
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y cmake build-essential libssl-dev pkg-config
+        
+    - name: Run tests
+      run: cargo test --verbose
+      
+    - name: Check code formatting
+      run: cargo fmt --all -- --check
+      
+
+  build-and-deploy:
+    needs: test
+    environment: test
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Log in to Container Registry
+      uses: docker/login-action@v2
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+        
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v4
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=sha,prefix={{branch}}-
+          
+    - name: Build Docker image (solo build local, sin push)
+      uses: docker/build-push-action@v4
+      with:
+        context: .
+        push: false
+        tags: siscom-trips:latest
+        labels: ${{ steps.meta.outputs.labels }}
+        
+    - name: Guardar imagen Docker como tar
+      run: docker save -o siscom-trips.tar siscom-trips:latest
+
+    - name: Cambiar permisos del archivo tar
+      run: chmod 644 siscom-trips.tar  
+
+    - name: Copiar imagen Docker a EC2
+      uses: appleboy/scp-action@v0.1.7
+      with:
+        host: ${{ secrets.EC2_HOST }}
+        username: ${{ secrets.EC2_USERNAME }}
+        port: ${{ secrets.EC2_SSH_PORT }}
+        key: ${{ secrets.EC2_SSH_KEY }}
+        source: "siscom-trips.tar"
+        target: "/tmp/"
+        overwrite: true
+        debug: true
+
+    - name: Deploy a EC2 usando imagen local
+      uses: appleboy/ssh-action@v0.1.7
+      with:
+        host: ${{ secrets.EC2_HOST }}
+        username: ${{ secrets.EC2_USERNAME }}
+        port: ${{ secrets.EC2_SSH_PORT }}
+        key: ${{ secrets.EC2_SSH_KEY }}
+        timeout: 60s
+        command_timeout: 10m
+        script: |
+          # Instalar Docker y Docker Compose si no están presentes
+          if ! command -v docker &> /dev/null; then
+            echo "Instalando Docker..."
+            sudo apt-get update
+            sudo apt-get install -y apt-transport-https ca-certificates curl gnupg lsb-release
+            curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
+            echo \
+              "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu \
+              $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+            sudo apt-get update
+            sudo apt-get install -y docker-ce docker-ce-cli containerd.io
+            sudo usermod -aG docker $USER
+          fi
+
+          sudo systemctl enable docker
+          sudo systemctl start docker
+
+          # Cargar la imagen Docker
+          docker load -i /tmp/siscom-trips.tar
+
+          # Stop existing container
+          docker stop siscom-trips || true
+          docker rm siscom-trips || true
+
+          # Create siscom network if it doesn't exist
+          docker network create siscom-network 2>/dev/null || true
+
+          # Run new container with environment variables
+          docker run -d \
+            --name siscom-trips \
+            --restart unless-stopped \
+            -v /var/log/siscom-trips:/var/log/siscom-trips \
+            --network siscom-network \
+            -e MQTT_BROKER="${{ vars.MQTT_BROKER }}" \
+            -e MQTT_PORT="${{ vars.MQTT_PORT }}" \
+            -e MQTT_USERNAME="${{ vars.MQTT_USERNAME }}" \
+            -e MQTT_PASSWORD="${{ secrets.MQTT_PASSWORD }}" \
+            -e MQTT_TOPIC="${{ vars.MQTT_TOPIC }}" \
+            -e DB_HOST="${{ vars.DB_HOST }}" \
+            -e DB_PORT="${{ vars.DB_PORT }}" \
+            -e DB_DATABASE="${{ vars.DB_DATABASE }}" \
+            -e DB_USER="${{ vars.DB_USER }}" \
+            -e DB_PWD="${{ secrets.DB_PWD }}" \
+            -e LOG_LEVEL="${{ vars.LOG_LEVEL }}" \
+            siscom-trips:latest
+
+          # Wait for container to start
+          echo "Esperando que el contenedor inicie..."
+          sleep 10
+
+          # Check container status
+          CONTAINER_STATUS=$(docker inspect -f '{{.State.Status}}' siscom-trips)
+          echo "Estado del contenedor: $CONTAINER_STATUS"
+
+          if [ "$CONTAINER_STATUS" != "running" ]; then
+            echo "❌ ERROR: El contenedor no está en estado 'running'"
+            echo "Logs del contenedor:"
+            docker logs siscom-trips --tail 100
+            exit 1
+          fi
+
+          # Check if container is restarting
+          RESTART_COUNT=$(docker inspect -f '{{.RestartCount}}' siscom-trips)
+          echo "Número de reinicios: $RESTART_COUNT"
+
+          if [ "$RESTART_COUNT" -gt "0" ]; then
+            echo "⚠️ WARNING: El contenedor se ha reiniciado $RESTART_COUNT veces"
+            echo "Logs del contenedor:"
+            docker logs siscom-trips --tail 100
+            exit 1
+          fi
+
+          # Check for errors in logs
+          echo "Verificando logs por errores..."
+          if docker logs siscom-trips 2>&1 | grep -i "error.*database\|failed to\|panic\|fatal"; then
+            echo "❌ ERROR: Se encontraron errores en los logs del contenedor"
+            echo "Logs completos:"
+            docker logs siscom-trips --tail 100
+            exit 1
+          fi
+
+          # Show logs if everything is OK
+          echo "✅ Contenedor iniciado correctamente"
+          docker logs siscom-trips --tail 50
+
+  cleanup:
+    runs-on: ubuntu-latest
+    needs: build-and-deploy
+    environment: test
+    if: always()
+
+    steps:
+    - name: Borrar archivo tar en EC2
+      uses: appleboy/ssh-action@v0.1.7
+      with:
+        host: ${{ secrets.EC2_HOST }}
+        username: ${{ secrets.EC2_USERNAME }}
+        port: ${{ secrets.EC2_SSH_PORT }}
+        key: ${{ secrets.EC2_SSH_KEY }}
+        script: |
+          rm -f /tmp/siscom-trips.tar

@@ -1,6 +1,6 @@
+use anyhow::Result;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{Pool, Postgres};
-use anyhow::Result;
 
 pub mod queries;
 

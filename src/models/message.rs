@@ -1,6 +1,6 @@
 use serde::{Deserialize, Deserializer, Serialize};
-use std::collections::HashMap;
 use serde_json::Value;
+use std::collections::HashMap;
 
 #[derive(Debug, Deserialize)]
 pub struct MqttMessage {
@@ -33,8 +33,6 @@ pub struct Data {
     pub correlation_id: Option<String>,
 }
 
-
-
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Metadata {
     #[serde(rename = "DEVICE_ID")]
@@ -45,7 +43,10 @@ pub struct Metadata {
 
 impl MqttMessage {
     pub fn get_device_id(&self) -> Option<&String> {
-        self.data.device_id.as_ref().or(self.metadata.device_id.as_ref())
+        self.data
+            .device_id
+            .as_ref()
+            .or(self.metadata.device_id.as_ref())
     }
 }
 

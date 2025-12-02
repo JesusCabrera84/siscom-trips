@@ -1,0 +1,46 @@
+version: '3.8'
+
+services:
+  siscom-trips:
+    build: .
+    container_name: siscom-trips-dev
+    volumes:
+      - ./logs:/var/log/siscom-trips
+    environment:
+      - RUST_LOG=${LOG_LEVEL:-info}
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      # MQTT Configuration
+      - MQTT_BROKER=${MQTT_BROKER:-localhost}
+      - MQTT_PORT=${MQTT_PORT:-1883}
+      - MQTT_USERNAME=${MQTT_USERNAME:-}
+      - MQTT_PASSWORD=${MQTT_PASSWORD:-}
+      - MQTT_TOPIC=${MQTT_TOPIC:-siscom/#}
+      # Database Configuration
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_DATABASE=${DB_DATABASE:-siscom_admin}
+      - DB_USER=${DB_USER:-siscom}
+      - DB_PWD=${DB_PWD:-siscom}
+    depends_on:
+      - postgres
+    networks:
+      - siscom-network
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: postgres-siscom
+    environment:
+      POSTGRES_DB: ${DB_DATABASE:-siscom_admin}
+      POSTGRES_USER: ${DB_USER:-siscom}
+      POSTGRES_PASSWORD: ${DB_PWD:-siscom}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - siscom-network
+
+volumes:
+  postgres_data:
+
+networks:
+  siscom-network:
+    driver: bridge

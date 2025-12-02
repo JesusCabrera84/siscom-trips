@@ -16,7 +16,7 @@ CREATE INDEX IF NOT EXISTS idx_trip_device ON public.trip USING btree (device_id
 CREATE INDEX IF NOT EXISTS idx_trip_start ON public.trip USING btree (start_time);
 
 -- public.trip_alerts definition
-CREATE TYPE alert_type_enum AS ENUM ('power_cut', 'jamming', 'ignition_on', 'ignition_off', 'low_backup_battery');
+
 
 CREATE TABLE IF NOT EXISTS trip_alerts (
     alert_id uuid NOT NULL,
@@ -24,7 +24,7 @@ CREATE TABLE IF NOT EXISTS trip_alerts (
     "timestamp" timestamptz NOT NULL,
     lat float8 NULL,
     lon float8 NULL,
-    alert_type public.alert_type_enum NOT NULL,
+    alert_type varchar NOT NULL,
     raw_code int4 NULL,
     severity int2 DEFAULT 1 NULL,
     metadata jsonb NULL,

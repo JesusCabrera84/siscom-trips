@@ -1,6 +1,6 @@
-use serde::Deserialize;
 use anyhow::Result;
 use dotenvy::dotenv;
+use serde::Deserialize;
 use std::env;
 
 #[derive(Debug, Deserialize, Clone)]
@@ -26,7 +26,7 @@ impl AppConfig {
         let mqtt_username = env::var("MQTT_USERNAME").unwrap_or_default();
         let mqtt_password = env::var("MQTT_PASSWORD").unwrap_or_default();
         let mqtt_topic = env::var("MQTT_TOPIC").unwrap_or_else(|_| "siscom/#".to_string());
-        
+
         let db_host = env::var("DB_HOST").unwrap_or_else(|_| "localhost".to_string());
         let db_port = env::var("DB_PORT").unwrap_or_else(|_| "5432".to_string());
         let db_name = env::var("DB_DATABASE").unwrap_or_else(|_| "siscom_admin".to_string());

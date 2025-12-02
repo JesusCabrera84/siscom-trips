@@ -1,9 +1,9 @@
-use crate::models::message::MqttMessage;
 use crate::db::queries;
-use sqlx::{Postgres, Row};
-use uuid::Uuid;
+use crate::models::message::MqttMessage;
 use chrono::NaiveDateTime;
-use tracing::{info, warn, error};
+use sqlx::{Postgres, Row};
+use tracing::{error, info, warn};
+use uuid::Uuid;
 
 pub async fn process_message(pool: &sqlx::Pool<Postgres>, payload: &[u8]) -> anyhow::Result<()> {
     // 1. Parse JSON
@@ -24,22 +24,23 @@ pub async fn process_message(pool: &sqlx::Pool<Postgres>, payload: &[u8]) -> any
         }
     };
 
-    info!("Processing message for device: {} uuid: {}\n", device_id_str, message.uuid);
+    info!(
+        "Processing message for device: {} uuid: {}\n",
+        device_id_str, message.uuid
+    );
 
     let message_uuid = Uuid::parse_str(&message.uuid).unwrap_or_else(|_| Uuid::new_v4());
 
     let gps_datetime_str = message.data.gps_datetime.as_deref().unwrap_or("");
     let timestamp = match NaiveDateTime::parse_from_str(gps_datetime_str, "%Y-%m-%d %H:%M:%S") {
         Ok(t) => t,
-        Err(_) => {
-             match NaiveDateTime::parse_from_str(gps_datetime_str, "%Y-%m-%dT%H:%M:%S") {
-                 Ok(t) => t,
-                 Err(_) => {
-                     warn!("Invalid GPS_DATETIME: '{}'", gps_datetime_str);
-                     return Ok(());
-                 }
-             }
-        }
+        Err(_) => match NaiveDateTime::parse_from_str(gps_datetime_str, "%Y-%m-%dT%H:%M:%S") {
+            Ok(t) => t,
+            Err(_) => {
+                warn!("Invalid GPS_DATETIME: '{}'", gps_datetime_str);
+                return Ok(());
+            }
+        },
     };
 
     let lat = message.data.latitude.unwrap_or(0.0);
@@ -61,13 +62,14 @@ pub async fn process_message(pool: &sqlx::Pool<Postgres>, payload: &[u8]) -> any
         .fetch_optional(&mut *tx)
         .await?;
 
-    let (mut last_trip_id, current_ignition_status): (Option<Uuid>, Option<bool>) = match active_trip_row {
-        Some(row) => (
-            row.try_get("current_trip_id").ok(),
-            row.try_get("ignition_on").ok(),
-        ),
-        None => (None, None),
-    };
+    let (mut last_trip_id, current_ignition_status): (Option<Uuid>, Option<bool>) =
+        match active_trip_row {
+            Some(row) => (
+                row.try_get("current_trip_id").ok(),
+                row.try_get("ignition_on").ok(),
+            ),
+            None => (None, None),
+        };
 
     // Rule: ignition_on = true cuando hay viaje activo
     let is_trip_active = current_ignition_status.unwrap_or(false);
@@ -78,7 +80,7 @@ pub async fn process_message(pool: &sqlx::Pool<Postgres>, payload: &[u8]) -> any
             .bind(&device_id_str)
             .fetch_optional(&mut *tx)
             .await?;
-        
+
         if let Some(row) = open_trip_row {
             last_trip_id = row.try_get("trip_id").ok();
         }
@@ -93,7 +95,7 @@ pub async fn process_message(pool: &sqlx::Pool<Postgres>, payload: &[u8]) -> any
     // The prompt says "Detectar ENGINE_ON -> ... -> actualizar current_state".
     // So we should probably do it as part of the specific actions to avoid double updates.
     // BUT, for "Si es punto válido -> trip_points + actualizar current_state".
-    
+
     // Let's handle the logic flow:
 
     if is_engine_on {
@@ -133,7 +135,13 @@ pub async fn process_message(pool: &sqlx::Pool<Postgres>, payload: &[u8]) -> any
                 .bind(lat)
                 .bind(lon)
                 .bind("ignition_on")
-                .bind(message.data.raw_code.as_deref().and_then(|s| s.parse::<i32>().ok()))
+                .bind(
+                    message
+                        .data
+                        .raw_code
+                        .as_deref()
+                        .and_then(|s| s.parse::<i32>().ok()),
+                )
                 .bind(1i16)
                 .bind(&device_id_str)
                 .bind(message_uuid)
@@ -189,19 +197,28 @@ pub async fn process_message(pool: &sqlx::Pool<Postgres>, payload: &[u8]) -> any
                     .bind(lat)
                     .bind(lon)
                     .bind("ignition_off")
-                    .bind(message.data.raw_code.as_deref().and_then(|s| s.parse::<i32>().ok()))
+                    .bind(
+                        message
+                            .data
+                            .raw_code
+                            .as_deref()
+                            .and_then(|s| s.parse::<i32>().ok()),
+                    )
                     .bind(1i16)
                     .bind(&device_id_str)
                     .bind(message_uuid)
                     .execute(&mut *tx)
                     .await?;
             } else {
-                error!("Active trip detected but no trip_id found for device {}", device_id_str);
+                error!(
+                    "Active trip detected but no trip_id found for device {}",
+                    device_id_str
+                );
             }
         } else {
-             info!("Ignored Engine OFF for inactive trip: {}", device_id_str);
-             // Update last point info
-             sqlx::query(queries::UPDATE_CURRENT_STATE_POINT)
+            info!("Ignored Engine OFF for inactive trip: {}", device_id_str);
+            // Update last point info
+            sqlx::query(queries::UPDATE_CURRENT_STATE_POINT)
                 .bind(&device_id_str)
                 .bind(timestamp)
                 .bind(lat)
@@ -224,19 +241,28 @@ pub async fn process_message(pool: &sqlx::Pool<Postgres>, payload: &[u8]) -> any
                         .bind(lat)
                         .bind(lon)
                         .bind(alert_name)
-                        .bind(message.data.raw_code.as_deref().and_then(|s| s.parse::<i32>().ok()))
+                        .bind(
+                            message
+                                .data
+                                .raw_code
+                                .as_deref()
+                                .and_then(|s| s.parse::<i32>().ok()),
+                        )
                         .bind(1i16)
                         .bind(&device_id_str)
                         .bind(message_uuid)
                         .execute(&mut *tx)
                         .await?;
                 } else {
-                    warn!("Cannot insert alert '{}' because no active trip found for device {}", alert_name, device_id_str);
+                    warn!(
+                        "Cannot insert alert '{}' because no active trip found for device {}",
+                        alert_name, device_id_str
+                    );
                 }
             }
         } else {
-             // No alert, insert point
-             if let Some(trip_id) = last_trip_id {
+            // No alert, insert point
+            if let Some(trip_id) = last_trip_id {
                 sqlx::query(queries::INSERT_TRIP_POINT)
                     .bind(trip_id)
                     .bind(&device_id_str)
@@ -248,7 +274,7 @@ pub async fn process_message(pool: &sqlx::Pool<Postgres>, payload: &[u8]) -> any
                     .bind(message_uuid)
                     .execute(&mut *tx)
                     .await?;
-             }
+            }
         }
 
         // Always update current state for active trip
@@ -261,7 +287,6 @@ pub async fn process_message(pool: &sqlx::Pool<Postgres>, payload: &[u8]) -> any
             .bind(message_uuid)
             .execute(&mut *tx)
             .await?;
-
     } else {
         // NO hay trip activo y NO es ENGINE_ON ni ENGINE_OFF
         // Guardar en device_idle_activity
@@ -270,7 +295,7 @@ pub async fn process_message(pool: &sqlx::Pool<Postgres>, payload: &[u8]) -> any
 
         let activity_type = match message.data.alert.as_deref() {
             Some(a) if !a.trim().is_empty() => a.to_string(),
-            _ => "gps_idle_point".to_string()
+            _ => "gps_idle_point".to_string(),
         };
 
         sqlx::query(queries::INSERT_DEVICE_IDLE_ACTIVITY)
@@ -280,7 +305,13 @@ pub async fn process_message(pool: &sqlx::Pool<Postgres>, payload: &[u8]) -> any
             .bind(lat)
             .bind(lon)
             .bind(activity_type)
-            .bind(message.data.raw_code.as_deref().and_then(|s| s.parse::<i32>().ok()))
+            .bind(
+                message
+                    .data
+                    .raw_code
+                    .as_deref()
+                    .and_then(|s| s.parse::<i32>().ok()),
+            )
             .bind(1i16)
             .bind(serde_json::to_value(&message.metadata).unwrap_or_default())
             .bind(message_uuid)
