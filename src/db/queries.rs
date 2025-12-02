@@ -66,3 +66,18 @@ INSERT INTO trip_alerts (
     alert_id, trip_id, timestamp, lat, lon, alert_type, raw_code, severity, device_id, correlation_id
 ) VALUES ($1, $2, $3, $4, $5, $6::alert_type_enum, $7, $8, $9, $10);
 "#;
+
+pub const INSERT_DEVICE_IDLE_ACTIVITY: &str = r#"
+INSERT INTO device_idle_activity (
+    idle_id,
+    device_id,
+    timestamp,
+    lat,
+    lon,
+    activity_type,
+    raw_code,
+    severity,
+    metadata,
+    correlation_id
+) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10);
+"#;

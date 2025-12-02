@@ -211,56 +211,32 @@ pub async fn process_message(pool: &sqlx::Pool<Postgres>, payload: &[u8]) -> any
                 .execute(&mut *tx)
                 .await?;
         }
-    } else if let Some(alert_name) = alert_type {
-        // Detectar otras alertas -> solo trip_alerts
-        // "no mapes las alartas, en su lugar, usa el valor de alert_type"
-        // "Si este viene vacio, considera k no es valida y no proceses la alerta"
-
-        if !alert_name.trim().is_empty() {
-            // We need a trip_id to insert alert.
-            // If active, use last_trip_id.
-            // If inactive, we cannot insert into trip_alerts (NOT NULL constraint).
-            if let Some(trip_id) = last_trip_id {
-                let alert_id = Uuid::new_v4();
-                sqlx::query(queries::INSERT_TRIP_ALERT)
-                    .bind(alert_id)
-                    .bind(trip_id)
-                    .bind(timestamp)
-                    .bind(lat)
-                    .bind(lon)
-                    .bind(alert_name) // Use raw alert name
-                    .bind(message.data.raw_code.as_deref().and_then(|s| s.parse::<i32>().ok()))
-                    .bind(1i16)
-                    .bind(&device_id_str)
-                    .bind(message_uuid)
-                    .execute(&mut *tx)
-                    .await?;
-            } else {
-                warn!("Cannot insert alert '{}' because no active trip found for device {}", alert_name, device_id_str);
+    } else if is_trip_active {
+        // Trip is active: Handle alerts or points
+        if let Some(alert_name) = alert_type {
+            if !alert_name.trim().is_empty() {
+                if let Some(trip_id) = last_trip_id {
+                    let alert_id = Uuid::new_v4();
+                    sqlx::query(queries::INSERT_TRIP_ALERT)
+                        .bind(alert_id)
+                        .bind(trip_id)
+                        .bind(timestamp)
+                        .bind(lat)
+                        .bind(lon)
+                        .bind(alert_name)
+                        .bind(message.data.raw_code.as_deref().and_then(|s| s.parse::<i32>().ok()))
+                        .bind(1i16)
+                        .bind(&device_id_str)
+                        .bind(message_uuid)
+                        .execute(&mut *tx)
+                        .await?;
+                } else {
+                    warn!("Cannot insert alert '{}' because no active trip found for device {}", alert_name, device_id_str);
+                }
             }
         } else {
-             warn!("Empty alert type received for device {}", device_id_str);
-        }
-
-        // Update last point info (Siempre actualizar)
-        sqlx::query(queries::UPDATE_CURRENT_STATE_POINT)
-            .bind(&device_id_str)
-            .bind(timestamp)
-            .bind(lat)
-            .bind(lon)
-            .bind(speed)
-            .bind(message_uuid)
-            .execute(&mut *tx)
-            .await?;
-
-    } else {
-        // Si es punto válido -> trip_points + actualizar current_state
-        // "SOLO insertar en trip_points si: Es un mensaje sin alert... Existe un viaje activo"
-        
-        if is_trip_active {
+             // No alert, insert point
              if let Some(trip_id) = last_trip_id {
-                // Insert Point
-                // "trip_points nunca debe tener un campo de ignición" -> Pass None
                 sqlx::query(queries::INSERT_TRIP_POINT)
                     .bind(trip_id)
                     .bind(&device_id_str)
@@ -275,7 +251,43 @@ pub async fn process_message(pool: &sqlx::Pool<Postgres>, payload: &[u8]) -> any
              }
         }
 
-        // Update last point info (Siempre actualizar)
+        // Always update current state for active trip
+        sqlx::query(queries::UPDATE_CURRENT_STATE_POINT)
+            .bind(&device_id_str)
+            .bind(timestamp)
+            .bind(lat)
+            .bind(lon)
+            .bind(speed)
+            .bind(message_uuid)
+            .execute(&mut *tx)
+            .await?;
+
+    } else {
+        // NO hay trip activo y NO es ENGINE_ON ni ENGINE_OFF
+        // Guardar en device_idle_activity
+
+        let idle_id = Uuid::new_v4();
+
+        let activity_type = match message.data.alert.as_deref() {
+            Some(a) if !a.trim().is_empty() => a.to_string(),
+            _ => "gps_idle_point".to_string()
+        };
+
+        sqlx::query(queries::INSERT_DEVICE_IDLE_ACTIVITY)
+            .bind(idle_id)
+            .bind(&device_id_str)
+            .bind(timestamp)
+            .bind(lat)
+            .bind(lon)
+            .bind(activity_type)
+            .bind(message.data.raw_code.as_deref().and_then(|s| s.parse::<i32>().ok()))
+            .bind(1i16)
+            .bind(serde_json::to_value(&message.metadata).unwrap_or_default())
+            .bind(message_uuid)
+            .execute(&mut *tx)
+            .await?;
+
+        // Siempre actualizar current state
         sqlx::query(queries::UPDATE_CURRENT_STATE_POINT)
             .bind(&device_id_str)
             .bind(timestamp)
