@@ -5,6 +5,74 @@ use sqlx::{Postgres, Row};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
+/// Detecta si el mensaje es un evento de encendido (ignition on)
+/// Soporta múltiples formatos de diferentes fabricantes:
+/// - "ENGINE ON" (formato genérico)
+/// - "TURN ON" (Queclink)
+pub fn is_ignition_on(alert: Option<&str>) -> bool {
+    match alert.map(|s| s.to_uppercase()) {
+        Some(ref s) => matches!(s.as_str(), "ENGINE ON" | "TURN ON"),
+        None => false,
+    }
+}
+
+/// Detecta si el mensaje es un evento de apagado (ignition off)
+/// Soporta múltiples formatos de diferentes fabricantes:
+/// - "ENGINE OFF" (formato genérico)
+/// - "TURN OFF" (Queclink)
+pub fn is_ignition_off(alert: Option<&str>) -> bool {
+    match alert.map(|s| s.to_uppercase()) {
+        Some(ref s) => matches!(s.as_str(), "ENGINE OFF" | "TURN OFF"),
+        None => false,
+    }
+}
+
+/// Determina el destino de un mensaje basado en el estado del viaje y el tipo de alerta
+#[derive(Debug, Clone, PartialEq)]
+pub enum MessageDestination {
+    /// Crear nuevo viaje (ignition on sin viaje activo)
+    NewTrip,
+    /// Cerrar viaje existente (ignition off con viaje activo)
+    EndTrip,
+    /// Agregar punto al viaje activo
+    TripPoint,
+    /// Agregar alerta al viaje activo
+    TripAlert,
+    /// Guardar en actividad idle (sin viaje activo y no es ignition)
+    IdleActivity,
+    /// Ignition on ignorado (ya hay viaje activo)
+    IgnoredIgnitionOn,
+    /// Ignition off ignorado (no hay viaje activo)
+    IgnoredIgnitionOff,
+}
+
+/// Determina a dónde debe ir un mensaje basado en el estado actual
+pub fn determine_destination(alert: Option<&str>, is_trip_active: bool) -> MessageDestination {
+    let engine_on = is_ignition_on(alert);
+    let engine_off = is_ignition_off(alert);
+
+    if engine_on {
+        if !is_trip_active {
+            MessageDestination::NewTrip
+        } else {
+            MessageDestination::IgnoredIgnitionOn
+        }
+    } else if engine_off {
+        if is_trip_active {
+            MessageDestination::EndTrip
+        } else {
+            MessageDestination::IgnoredIgnitionOff
+        }
+    } else if is_trip_active {
+        match alert {
+            Some(a) if !a.trim().is_empty() => MessageDestination::TripAlert,
+            _ => MessageDestination::TripPoint,
+        }
+    } else {
+        MessageDestination::IdleActivity
+    }
+}
+
 pub async fn process_message(pool: &sqlx::Pool<Postgres>, payload: &[u8]) -> anyhow::Result<()> {
     // 1. Parse JSON
     let message: MqttMessage = match serde_json::from_slice(payload) {
@@ -49,9 +117,8 @@ pub async fn process_message(pool: &sqlx::Pool<Postgres>, payload: &[u8]) -> any
     // let heading = message.data.heading.unwrap_or(0.0); // Not used in current logic
 
     let alert_type = message.data.alert.as_deref();
-    let alert_type_upper = alert_type.map(|s| s.to_uppercase());
-    let is_engine_on = alert_type_upper.as_deref() == Some("ENGINE ON");
-    let is_engine_off = alert_type_upper.as_deref() == Some("ENGINE OFF");
+    let is_engine_on = is_ignition_on(alert_type);
+    let is_engine_off = is_ignition_off(alert_type);
 
     // 3. Start Transaction
     let mut tx = pool.begin().await?;
@@ -333,4 +400,159 @@ pub async fn process_message(pool: &sqlx::Pool<Postgres>, payload: &[u8]) -> any
     tx.commit().await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ==================== Tests de detección de ignition ====================
+
+    #[test]
+    fn test_is_ignition_on_engine_on() {
+        assert!(is_ignition_on(Some("ENGINE ON")));
+        assert!(is_ignition_on(Some("engine on")));
+        assert!(is_ignition_on(Some("Engine On")));
+    }
+
+    #[test]
+    fn test_is_ignition_on_turn_on_queclink() {
+        assert!(is_ignition_on(Some("TURN ON")));
+        assert!(is_ignition_on(Some("turn on")));
+        assert!(is_ignition_on(Some("Turn On")));
+    }
+
+    #[test]
+    fn test_is_ignition_on_negative_cases() {
+        assert!(!is_ignition_on(None));
+        assert!(!is_ignition_on(Some("")));
+        assert!(!is_ignition_on(Some("ENGINE OFF")));
+        assert!(!is_ignition_on(Some("TURN OFF")));
+        assert!(!is_ignition_on(Some("SPEEDING")));
+        assert!(!is_ignition_on(Some("LOW BATTERY")));
+    }
+
+    #[test]
+    fn test_is_ignition_off_engine_off() {
+        assert!(is_ignition_off(Some("ENGINE OFF")));
+        assert!(is_ignition_off(Some("engine off")));
+        assert!(is_ignition_off(Some("Engine Off")));
+    }
+
+    #[test]
+    fn test_is_ignition_off_turn_off_queclink() {
+        assert!(is_ignition_off(Some("TURN OFF")));
+        assert!(is_ignition_off(Some("turn off")));
+        assert!(is_ignition_off(Some("Turn Off")));
+    }
+
+    #[test]
+    fn test_is_ignition_off_negative_cases() {
+        assert!(!is_ignition_off(None));
+        assert!(!is_ignition_off(Some("")));
+        assert!(!is_ignition_off(Some("ENGINE ON")));
+        assert!(!is_ignition_off(Some("TURN ON")));
+        assert!(!is_ignition_off(Some("SPEEDING")));
+    }
+
+    // ==================== Tests de destino de mensajes ====================
+
+    #[test]
+    fn test_destination_queclink_turn_on_no_active_trip() {
+        // Queclink "Turn On" sin viaje activo -> debe crear nuevo trip
+        let dest = determine_destination(Some("Turn On"), false);
+        assert_eq!(dest, MessageDestination::NewTrip);
+    }
+
+    #[test]
+    fn test_destination_queclink_turn_on_with_active_trip() {
+        // Queclink "Turn On" con viaje activo -> ignorar
+        let dest = determine_destination(Some("Turn On"), true);
+        assert_eq!(dest, MessageDestination::IgnoredIgnitionOn);
+    }
+
+    #[test]
+    fn test_destination_queclink_turn_off_with_active_trip() {
+        // Queclink "Turn Off" con viaje activo -> cerrar trip
+        let dest = determine_destination(Some("Turn Off"), true);
+        assert_eq!(dest, MessageDestination::EndTrip);
+    }
+
+    #[test]
+    fn test_destination_queclink_turn_off_no_active_trip() {
+        // Queclink "Turn Off" sin viaje activo -> ignorar
+        let dest = determine_destination(Some("Turn Off"), false);
+        assert_eq!(dest, MessageDestination::IgnoredIgnitionOff);
+    }
+
+    #[test]
+    fn test_destination_engine_on_no_active_trip() {
+        // ENGINE ON sin viaje activo -> crear nuevo trip
+        let dest = determine_destination(Some("ENGINE ON"), false);
+        assert_eq!(dest, MessageDestination::NewTrip);
+    }
+
+    #[test]
+    fn test_destination_engine_off_with_active_trip() {
+        // ENGINE OFF con viaje activo -> cerrar trip
+        let dest = determine_destination(Some("ENGINE OFF"), true);
+        assert_eq!(dest, MessageDestination::EndTrip);
+    }
+
+    #[test]
+    fn test_destination_alert_with_active_trip() {
+        // Alerta (ej: SPEEDING) con viaje activo -> agregar como alerta al trip
+        let dest = determine_destination(Some("SPEEDING"), true);
+        assert_eq!(dest, MessageDestination::TripAlert);
+
+        let dest = determine_destination(Some("LOW BATTERY"), true);
+        assert_eq!(dest, MessageDestination::TripAlert);
+    }
+
+    #[test]
+    fn test_destination_no_alert_with_active_trip() {
+        // Sin alerta con viaje activo -> agregar punto al trip
+        let dest = determine_destination(None, true);
+        assert_eq!(dest, MessageDestination::TripPoint);
+
+        let dest = determine_destination(Some(""), true);
+        assert_eq!(dest, MessageDestination::TripPoint);
+
+        let dest = determine_destination(Some("   "), true);
+        assert_eq!(dest, MessageDestination::TripPoint);
+    }
+
+    #[test]
+    fn test_destination_no_alert_no_active_trip() {
+        // Sin alerta y sin viaje activo -> idle activity
+        let dest = determine_destination(None, false);
+        assert_eq!(dest, MessageDestination::IdleActivity);
+    }
+
+    #[test]
+    fn test_destination_other_alert_no_active_trip() {
+        // Otra alerta sin viaje activo -> idle activity
+        let dest = determine_destination(Some("LOW BATTERY"), false);
+        assert_eq!(dest, MessageDestination::IdleActivity);
+
+        let dest = determine_destination(Some("SPEEDING"), false);
+        assert_eq!(dest, MessageDestination::IdleActivity);
+    }
+
+    // ==================== Test del mensaje específico de Queclink ====================
+
+    #[test]
+    fn test_queclink_gtvgn_message_should_create_trip() {
+        // Este es el mensaje real de Queclink que estaba fallando
+        let alert = Some("Turn On");
+        let is_trip_active = false;
+
+        let dest = determine_destination(alert, is_trip_active);
+
+        assert_eq!(
+            dest,
+            MessageDestination::NewTrip,
+            "El mensaje GTVGN de Queclink con 'Turn On' debe crear un nuevo trip"
+        );
+    }
 }
