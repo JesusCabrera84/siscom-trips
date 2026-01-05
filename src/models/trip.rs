@@ -13,4 +13,6 @@ pub struct Trip {
     pub end_lat: Option<f64>,
     pub end_lng: Option<f64>,
     pub distance_meters: Option<f64>,
+    pub start_odometer_meters: Option<i32>,
+    pub end_odometer_meters: Option<i32>,
 }

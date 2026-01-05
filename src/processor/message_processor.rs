@@ -114,6 +114,8 @@ pub async fn process_message(pool: &sqlx::Pool<Postgres>, payload: &[u8]) -> any
     let lat = message.data.latitude.unwrap_or(0.0);
     let lon = message.data.longitude.unwrap_or(0.0);
     let speed = message.data.speed.unwrap_or(0.0);
+    // message.data.odometer is in meters
+    let odometer_meters = message.data.odometer.unwrap_or(0.0);
     // let heading = message.data.heading.unwrap_or(0.0); // Not used in current logic
 
     let alert_type = message.data.alert.as_deref();
@@ -178,6 +180,7 @@ pub async fn process_message(pool: &sqlx::Pool<Postgres>, payload: &[u8]) -> any
                 .bind(timestamp)
                 .bind(lat)
                 .bind(lon)
+                .bind(odometer_meters)
                 .execute(&mut *tx)
                 .await?;
 
@@ -190,6 +193,7 @@ pub async fn process_message(pool: &sqlx::Pool<Postgres>, payload: &[u8]) -> any
                 .bind(lat)
                 .bind(lon)
                 .bind(message_uuid)
+                .bind(odometer_meters)
                 .execute(&mut *tx)
                 .await?;
 
@@ -225,6 +229,7 @@ pub async fn process_message(pool: &sqlx::Pool<Postgres>, payload: &[u8]) -> any
                 .bind(lon)
                 .bind(speed)
                 .bind(message_uuid)
+                .bind(odometer_meters)
                 .execute(&mut *tx)
                 .await?;
         }
@@ -239,6 +244,7 @@ pub async fn process_message(pool: &sqlx::Pool<Postgres>, payload: &[u8]) -> any
                     .bind(timestamp)
                     .bind(lat)
                     .bind(lon)
+                    .bind(odometer_meters)
                     .bind(trip_id)
                     .execute(&mut *tx)
                     .await?;
@@ -292,6 +298,7 @@ pub async fn process_message(pool: &sqlx::Pool<Postgres>, payload: &[u8]) -> any
                 .bind(lon)
                 .bind(speed)
                 .bind(message_uuid)
+                .bind(odometer_meters)
                 .execute(&mut *tx)
                 .await?;
         }
@@ -338,6 +345,7 @@ pub async fn process_message(pool: &sqlx::Pool<Postgres>, payload: &[u8]) -> any
                     .bind(lon)
                     .bind(speed)
                     .bind(message.data.heading.unwrap_or(0.0))
+                    .bind(odometer_meters)
                     .bind(message_uuid)
                     .execute(&mut *tx)
                     .await?;
@@ -352,6 +360,7 @@ pub async fn process_message(pool: &sqlx::Pool<Postgres>, payload: &[u8]) -> any
             .bind(lon)
             .bind(speed)
             .bind(message_uuid)
+            .bind(odometer_meters)
             .execute(&mut *tx)
             .await?;
     } else {
@@ -393,6 +402,7 @@ pub async fn process_message(pool: &sqlx::Pool<Postgres>, payload: &[u8]) -> any
             .bind(lon)
             .bind(speed)
             .bind(message_uuid)
+            .bind(odometer_meters)
             .execute(&mut *tx)
             .await?;
     }

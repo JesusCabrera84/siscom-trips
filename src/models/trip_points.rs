@@ -12,5 +12,6 @@ pub struct TripPoint {
     pub lng: f64, // DDL says lng
     pub speed: Option<f64>,
     pub heading: Option<f64>,
+    pub odometer_meters: Option<i32>,
     pub correlation_id: Uuid,
 }

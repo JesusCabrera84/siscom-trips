@@ -47,6 +47,7 @@ CREATE TABLE IF NOT EXISTS trip_current_state (
     last_lat float8 NULL,
     last_lng float8 NULL,
     last_speed float8 NULL,
+    last_odometer_meters int4 NULL,
     last_correlation_id uuid NULL,
     last_updated_at timestamptz DEFAULT now() NOT NULL,
     CONSTRAINT trip_current_state_pkey PRIMARY KEY (device_id)
