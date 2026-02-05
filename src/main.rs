@@ -1,7 +1,7 @@
 mod config;
 mod db;
+mod kafka;
 mod models;
-mod mqtt;
 mod processor;
 
 use config::AppConfig;
@@ -17,14 +17,14 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(&config.log_level)
         .init();
 
-    info!("Starting Siscom Trips Service...");
+    info!("Starting Siscom Trips Service (Kafka Edition)...");
 
     // Init DB
     let pool = db::init_pool(&config.database_url).await?;
     info!("Connected to database");
 
-    // Start MQTT
-    mqtt::start_mqtt_client(&config, pool).await?;
+    // Start Kafka
+    kafka::start_kafka_consumer(&config, pool).await?;
 
     Ok(())
 }

@@ -3,6 +3,7 @@ use sqlx::FromRow;
 use uuid::Uuid;
 
 #[derive(Debug, FromRow)]
+#[allow(dead_code)]
 pub struct Trip {
     pub trip_id: Uuid,
     pub device_id: Uuid, // DDL says uuid

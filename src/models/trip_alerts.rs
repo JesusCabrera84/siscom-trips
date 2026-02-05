@@ -6,6 +6,7 @@ use serde_json::Value;
 use sqlx::types::Json;
 
 #[derive(Debug, FromRow)]
+#[allow(dead_code)]
 pub struct TripAlert {
     pub alert_id: Uuid,
     pub trip_id: Uuid, // DDL says NOT NULL

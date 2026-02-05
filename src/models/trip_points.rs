@@ -3,6 +3,7 @@ use sqlx::FromRow;
 use uuid::Uuid;
 
 #[derive(Debug, FromRow)]
+#[allow(dead_code)]
 pub struct TripPoint {
     pub point_id: i64, // bigserial
     pub trip_id: Uuid,

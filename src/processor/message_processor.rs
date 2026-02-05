@@ -1,9 +1,12 @@
 use crate::db::queries;
-use crate::models::message::MqttMessage;
-use chrono::NaiveDateTime;
+use crate::models::siscom::v1::KafkaMessage;
+use chrono::{TimeZone, Utc};
+use prost::Message;
 use sqlx::{Postgres, Row};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
+
+// ... (is_ignition_on, is_ignition_off, determine_destination, MessageDestination remains)
 
 /// Detecta si el mensaje es un evento de encendido (ignition on)
 /// Soporta múltiples formatos de diferentes fabricantes:
@@ -74,54 +77,58 @@ pub fn determine_destination(alert: Option<&str>, is_trip_active: bool) -> Messa
 }
 
 pub async fn process_message(pool: &sqlx::Pool<Postgres>, payload: &[u8]) -> anyhow::Result<()> {
-    // 1. Parse JSON
-    let message: MqttMessage = match serde_json::from_slice(payload) {
+    // 1. Parse Protobuf
+    let message = match KafkaMessage::decode(payload) {
         Ok(m) => m,
         Err(e) => {
-            warn!("Failed to parse message: {}", e);
+            warn!("Failed to decode Protobuf KafkaMessage: {}", e);
             return Ok(());
         }
     };
 
     // 2. Extract Data
-    let device_id_str = match message.get_device_id() {
-        Some(id) => id.clone(),
-        None => {
-            warn!("Message missing device_id, skipping");
-            return Ok(());
-        }
-    };
+    let device_id_str = message.data.get("DEVICE_ID").cloned().unwrap_or_default();
+    if device_id_str.is_empty() {
+        warn!("Message missing DEVICE_ID in data map, skipping");
+        return Ok(());
+    }
 
     info!(
-        "Processing message for device: {} uuid: {}\n",
+        "Processing Protobuf message for device: {} uuid: {}\n",
         device_id_str, message.uuid
     );
 
     let message_uuid = Uuid::parse_str(&message.uuid).unwrap_or_else(|_| Uuid::new_v4());
 
-    let gps_datetime_str = message.data.gps_datetime.as_deref().unwrap_or("");
-    let timestamp = match NaiveDateTime::parse_from_str(gps_datetime_str, "%Y-%m-%d %H:%M:%S") {
-        Ok(t) => t,
-        Err(_) => match NaiveDateTime::parse_from_str(gps_datetime_str, "%Y-%m-%dT%H:%M:%S") {
-            Ok(t) => t,
-            Err(_) => {
-                warn!("Invalid GPS_DATETIME: '{}'", gps_datetime_str);
-                return Ok(());
+    // Use GPS_EPOCH if available, otherwise fallback to decoded_epoch or current time
+    let timestamp = if let Some(epoch_str) = message.data.get("GPS_EPOCH") {
+        if let Ok(epoch) = epoch_str.parse::<i64>() {
+            Utc.timestamp_opt(epoch, 0).single().map(|t| t.naive_utc())
+        } else {
+            None
+        }
+    } else {
+        None
+    }.unwrap_or_else(|| {
+        if let Some(metadata) = message.metadata.as_ref() {
+            if metadata.decoded_epoch > 0 {
+                return Utc.timestamp_millis_opt(metadata.decoded_epoch as i64)
+                    .single()
+                    .map(|t| t.naive_utc())
+                    .unwrap_or_else(|| Utc::now().naive_utc());
             }
-        },
-    };
+        }
+        Utc::now().naive_utc()
+    });
 
-    let lat = message.data.latitude.unwrap_or(0.0);
-    let lon = message.data.longitude.unwrap_or(0.0);
-    let speed = message.data.speed.unwrap_or(0.0);
-    // message.data.odometer is in meters
-    let odometer_meters = message.data.odometer.unwrap_or(0.0);
-    // let heading = message.data.heading.unwrap_or(0.0); // Not used in current logic
+    let lat = message.data.get("LATITUD").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+    let lon = message.data.get("LONGITUD").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+    let speed = message.data.get("SPEED").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+    let odometer_meters = message.data.get("ODOMETER").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+    let heading = message.data.get("COURSE").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
 
-    let alert_type = message.data.alert.as_deref();
-    let is_engine_on = is_ignition_on(alert_type);
-    let is_engine_off = is_ignition_off(alert_type);
-
+    let alert_type = message.data.get("ALERT").map(|s| s.as_str());
+    
     // 3. Start Transaction
     let mut tx = pool.begin().await?;
 
@@ -143,7 +150,7 @@ pub async fn process_message(pool: &sqlx::Pool<Postgres>, payload: &[u8]) -> any
     // Rule: ignition_on = true cuando hay viaje activo
     let is_trip_active = current_ignition_status.unwrap_or(false);
 
-    // If trip is active but we don't have the ID (because it's NULL in current state), fetch it from trips table
+    // If trip is active but we don't have the ID, fetch it
     if is_trip_active && last_trip_id.is_none() {
         let open_trip_row = sqlx::query(queries::SELECT_LATEST_OPEN_TRIP)
             .bind(&device_id_str)
@@ -155,25 +162,15 @@ pub async fn process_message(pool: &sqlx::Pool<Postgres>, payload: &[u8]) -> any
         }
     }
 
-    // 5. Update Current State (Always update last point info)
-    // "Siempre actualizar last_point_at, last_lat, last_lng, last_speed"
-    // Note: We use UPDATE_CURRENT_STATE_POINT for this generic update.
-    // However, if we are creating a NEW trip, we use UPDATE_CURRENT_STATE_NEW_TRIP which also sets these.
-    // If we are ENDING a trip, we use UPDATE_CURRENT_STATE_END_TRIP.
-    // So we will do specific updates inside the rules, OR a generic one if no state change?
-    // The prompt says "Detectar ENGINE_ON -> ... -> actualizar current_state".
-    // So we should probably do it as part of the specific actions to avoid double updates.
-    // BUT, for "Si es punto válido -> trip_points + actualizar current_state".
+    // 5. Determine Destination and Process
+    let destination = determine_destination(alert_type, is_trip_active);
+    debug!("Message destination for {}: {:?}", device_id_str, destination);
 
-    // Let's handle the logic flow:
-
-    if is_engine_on {
-        // Detectar ENGINE_ON -> crear trip -> alert -> actualizar current_state
-        if !is_trip_active {
-            let trip_id = message_uuid; // Use message UUID as trip ID
+    match destination {
+        MessageDestination::NewTrip => {
+            let trip_id = message_uuid;
             info!("Started new trip {} for device {}", trip_id, device_id_str);
 
-            // Create Trip
             sqlx::query(queries::INSERT_TRIP)
                 .bind(trip_id)
                 .bind(&device_id_str)
@@ -184,11 +181,9 @@ pub async fn process_message(pool: &sqlx::Pool<Postgres>, payload: &[u8]) -> any
                 .execute(&mut *tx)
                 .await?;
 
-            // Update Current State (New Trip)
-            // Sets ignition_on = true, current_trip_id = NULL
             sqlx::query(queries::UPDATE_CURRENT_STATE_NEW_TRIP)
                 .bind(&device_id_str)
-                .bind(trip_id) // This param is used for last_point logic if needed, but query sets current_trip_id=NULL
+                .bind(trip_id)
                 .bind(timestamp)
                 .bind(lat)
                 .bind(lon)
@@ -197,7 +192,6 @@ pub async fn process_message(pool: &sqlx::Pool<Postgres>, payload: &[u8]) -> any
                 .execute(&mut *tx)
                 .await?;
 
-            // Insert Alert (ignition_on)
             let alert_id = Uuid::new_v4();
             sqlx::query(queries::INSERT_TRIP_ALERT)
                 .bind(alert_id)
@@ -207,10 +201,7 @@ pub async fn process_message(pool: &sqlx::Pool<Postgres>, payload: &[u8]) -> any
                 .bind(lon)
                 .bind("ignition_on")
                 .bind(
-                    message
-                        .data
-                        .raw_code
-                        .as_deref()
+                    message.data.get("RAW_CODE")
                         .and_then(|s| s.parse::<i32>().ok()),
                 )
                 .bind(1i16)
@@ -218,28 +209,11 @@ pub async fn process_message(pool: &sqlx::Pool<Postgres>, payload: &[u8]) -> any
                 .bind(message_uuid)
                 .execute(&mut *tx)
                 .await?;
-        } else {
-            info!("Ignored Engine ON for active trip: {}", device_id_str);
-            // Even if ignored, we should probably update last_point info?
-            // User says "Siempre actualizar...".
-            sqlx::query(queries::UPDATE_CURRENT_STATE_POINT)
-                .bind(&device_id_str)
-                .bind(timestamp)
-                .bind(lat)
-                .bind(lon)
-                .bind(speed)
-                .bind(message_uuid)
-                .bind(odometer_meters)
-                .execute(&mut *tx)
-                .await?;
         }
-    } else if is_engine_off {
-        // Detectar ENGINE_OFF -> cerrar trip -> alert -> limpiar current_state
-        if is_trip_active {
+        MessageDestination::EndTrip => {
             if let Some(trip_id) = last_trip_id {
                 info!("Ended trip {} for device {}", trip_id, device_id_str);
 
-                // Close Trip
                 sqlx::query(queries::UPDATE_TRIP_END)
                     .bind(timestamp)
                     .bind(lat)
@@ -249,8 +223,6 @@ pub async fn process_message(pool: &sqlx::Pool<Postgres>, payload: &[u8]) -> any
                     .execute(&mut *tx)
                     .await?;
 
-                // Update Current State (End Trip)
-                // Sets ignition_on = false, current_trip_id = NULL
                 sqlx::query(queries::UPDATE_CURRENT_STATE_END_TRIP)
                     .bind(&device_id_str)
                     .bind(message_uuid)
@@ -261,7 +233,6 @@ pub async fn process_message(pool: &sqlx::Pool<Postgres>, payload: &[u8]) -> any
                     .execute(&mut *tx)
                     .await?;
 
-                // Insert Alert (ignition_off)
                 let alert_id = Uuid::new_v4();
                 sqlx::query(queries::INSERT_TRIP_ALERT)
                     .bind(alert_id)
@@ -271,10 +242,7 @@ pub async fn process_message(pool: &sqlx::Pool<Postgres>, payload: &[u8]) -> any
                     .bind(lon)
                     .bind("ignition_off")
                     .bind(
-                        message
-                            .data
-                            .raw_code
-                            .as_deref()
+                        message.data.get("RAW_CODE")
                             .and_then(|s| s.parse::<i32>().ok()),
                     )
                     .bind(1i16)
@@ -283,14 +251,30 @@ pub async fn process_message(pool: &sqlx::Pool<Postgres>, payload: &[u8]) -> any
                     .execute(&mut *tx)
                     .await?;
             } else {
-                error!(
-                    "Active trip detected but no trip_id found for device {}",
-                    device_id_str
-                );
+                error!("Active trip state without trip_id for end trip: {}", device_id_str);
             }
-        } else {
-            info!("Ignored Engine OFF for inactive trip: {}", device_id_str);
-            // Update last point info
+        }
+        MessageDestination::TripAlert => {
+            if let Some(trip_id) = last_trip_id {
+                let alert_id = Uuid::new_v4();
+                sqlx::query(queries::INSERT_TRIP_ALERT)
+                    .bind(alert_id)
+                    .bind(trip_id)
+                    .bind(timestamp)
+                    .bind(lat)
+                    .bind(lon)
+                    .bind(alert_type.unwrap_or(""))
+                    .bind(
+                        message.data.get("RAW_CODE")
+                            .and_then(|s| s.parse::<i32>().ok()),
+                    )
+                    .bind(1i16)
+                    .bind(&device_id_str)
+                    .bind(message_uuid)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            
             sqlx::query(queries::UPDATE_CURRENT_STATE_POINT)
                 .bind(&device_id_str)
                 .bind(timestamp)
@@ -302,40 +286,7 @@ pub async fn process_message(pool: &sqlx::Pool<Postgres>, payload: &[u8]) -> any
                 .execute(&mut *tx)
                 .await?;
         }
-    } else if is_trip_active {
-        // Trip is active: Handle alerts or points
-        if let Some(alert_name) = alert_type {
-            if !alert_name.trim().is_empty() {
-                if let Some(trip_id) = last_trip_id {
-                    let alert_id = Uuid::new_v4();
-                    sqlx::query(queries::INSERT_TRIP_ALERT)
-                        .bind(alert_id)
-                        .bind(trip_id)
-                        .bind(timestamp)
-                        .bind(lat)
-                        .bind(lon)
-                        .bind(alert_name)
-                        .bind(
-                            message
-                                .data
-                                .raw_code
-                                .as_deref()
-                                .and_then(|s| s.parse::<i32>().ok()),
-                        )
-                        .bind(1i16)
-                        .bind(&device_id_str)
-                        .bind(message_uuid)
-                        .execute(&mut *tx)
-                        .await?;
-                } else {
-                    warn!(
-                        "Cannot insert alert '{}' because no active trip found for device {}",
-                        alert_name, device_id_str
-                    );
-                }
-            }
-        } else {
-            // No alert, insert point
+        MessageDestination::TripPoint => {
             if let Some(trip_id) = last_trip_id {
                 sqlx::query(queries::INSERT_TRIP_POINT)
                     .bind(trip_id)
@@ -343,68 +294,84 @@ pub async fn process_message(pool: &sqlx::Pool<Postgres>, payload: &[u8]) -> any
                     .bind(timestamp)
                     .bind(lat)
                     .bind(lon)
+                    .bind(lon)
                     .bind(speed)
-                    .bind(message.data.heading.unwrap_or(0.0))
+                    .bind(heading)
                     .bind(odometer_meters)
                     .bind(message_uuid)
                     .execute(&mut *tx)
                     .await?;
             }
+
+            sqlx::query(queries::UPDATE_CURRENT_STATE_POINT)
+                .bind(&device_id_str)
+                .bind(timestamp)
+                .bind(lat)
+                .bind(lon)
+                .bind(speed)
+                .bind(message_uuid)
+                .bind(odometer_meters)
+                .execute(&mut *tx)
+                .await?;
         }
+        MessageDestination::IdleActivity => {
+            let idle_id = Uuid::new_v4();
+            let activity_type = alert_type.unwrap_or("gps_idle_point");
 
-        // Always update current state for active trip
-        sqlx::query(queries::UPDATE_CURRENT_STATE_POINT)
-            .bind(&device_id_str)
-            .bind(timestamp)
-            .bind(lat)
-            .bind(lon)
-            .bind(speed)
-            .bind(message_uuid)
-            .bind(odometer_meters)
-            .execute(&mut *tx)
-            .await?;
-    } else {
-        // NO hay trip activo y NO es ENGINE_ON ni ENGINE_OFF
-        // Guardar en device_idle_activity
+            let metadata_json = if let Some(m) = message.metadata {
+                serde_json::json!({
+                    "worker_id": m.worker_id,
+                    "received_epoch": m.received_epoch,
+                    "decoded_epoch": m.decoded_epoch,
+                    "bytes": m.bytes,
+                    "client_ip": m.client_ip,
+                    "client_port": m.client_port
+                })
+            } else {
+                serde_json::Value::Null
+            };
 
-        let idle_id = Uuid::new_v4();
+            sqlx::query(queries::INSERT_DEVICE_IDLE_ACTIVITY)
+                .bind(idle_id)
+                .bind(&device_id_str)
+                .bind(timestamp)
+                .bind(lat)
+                .bind(lon)
+                .bind(activity_type)
+                .bind(
+                    message.data.get("RAW_CODE")
+                        .and_then(|s| s.parse::<i32>().ok()),
+                )
+                .bind(1i16)
+                .bind(metadata_json)
+                .bind(message_uuid)
+                .execute(&mut *tx)
+                .await?;
 
-        let activity_type = match message.data.alert.as_deref() {
-            Some(a) if !a.trim().is_empty() => a.to_string(),
-            _ => "gps_idle_point".to_string(),
-        };
-
-        sqlx::query(queries::INSERT_DEVICE_IDLE_ACTIVITY)
-            .bind(idle_id)
-            .bind(&device_id_str)
-            .bind(timestamp)
-            .bind(lat)
-            .bind(lon)
-            .bind(activity_type)
-            .bind(
-                message
-                    .data
-                    .raw_code
-                    .as_deref()
-                    .and_then(|s| s.parse::<i32>().ok()),
-            )
-            .bind(1i16)
-            .bind(serde_json::to_value(&message.metadata).unwrap_or_default())
-            .bind(message_uuid)
-            .execute(&mut *tx)
-            .await?;
-
-        // Siempre actualizar current state
-        sqlx::query(queries::UPDATE_CURRENT_STATE_POINT)
-            .bind(&device_id_str)
-            .bind(timestamp)
-            .bind(lat)
-            .bind(lon)
-            .bind(speed)
-            .bind(message_uuid)
-            .bind(odometer_meters)
-            .execute(&mut *tx)
-            .await?;
+            sqlx::query(queries::UPDATE_CURRENT_STATE_POINT)
+                .bind(&device_id_str)
+                .bind(timestamp)
+                .bind(lat)
+                .bind(lon)
+                .bind(speed)
+                .bind(message_uuid)
+                .bind(odometer_meters)
+                .execute(&mut *tx)
+                .await?;
+        }
+        MessageDestination::IgnoredIgnitionOn | MessageDestination::IgnoredIgnitionOff => {
+            info!("Ignored ignition event ({:?}) for device {}", destination, device_id_str);
+            sqlx::query(queries::UPDATE_CURRENT_STATE_POINT)
+                .bind(&device_id_str)
+                .bind(timestamp)
+                .bind(lat)
+                .bind(lon)
+                .bind(speed)
+                .bind(message_uuid)
+                .bind(odometer_meters)
+                .execute(&mut *tx)
+                .await?;
+        }
     }
 
     tx.commit().await?;

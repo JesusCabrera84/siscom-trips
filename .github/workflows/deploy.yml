@@ -142,11 +142,16 @@ jobs:
             --restart unless-stopped \
             -v /var/log/siscom-trips:/var/log/siscom-trips \
             --network siscom-network \
-            -e MQTT_BROKER="${{ vars.MQTT_BROKER }}" \
-            -e MQTT_PORT="${{ vars.MQTT_PORT }}" \
-            -e MQTT_USERNAME="${{ vars.MQTT_USERNAME }}" \
-            -e MQTT_PASSWORD="${{ secrets.MQTT_PASSWORD }}" \
-            -e MQTT_TOPIC="${{ vars.MQTT_TOPIC }}" \
+            -e KAFKA_BOOTSTRAP_SERVERS="${{ vars.KAFKA_BOOTSTRAP_SERVERS }}" \
+            -e KAFKA_TOPIC="${{ vars.KAFKA_TOPIC }}" \
+            -e KAFKA_GROUP_ID="${{ vars.KAFKA_GROUP_ID }}" \
+            -e KAFKA_AUTO_OFFSET_RESET="${{ vars.KAFKA_AUTO_OFFSET_RESET }}" \
+            -e KAFKA_SECURITY_PROTOCOL="${{ vars.KAFKA_SECURITY_PROTOCOL }}" \
+            -e KAFKA_MAX_RETRIES="${{ vars.KAFKA_MAX_RETRIES }}" \
+            -e KAFKA_CIRCUIT_BREAKER_COOLDOWN="${{ vars.KAFKA_CIRCUIT_BREAKER_COOLDOWN }}" \
+            -e KAFKA_SASL_MECHANISM="${{ vars.KAFKA_SASL_MECHANISM }}" \
+            -e KAFKA_USERNAME="${{ vars.KAFKA_USERNAME }}" \
+            -e KAFKA_PASSWORD="${{ secrets.KAFKA_PASSWORD }}" \
             -e DB_HOST="${{ vars.DB_HOST }}" \
             -e DB_PORT="${{ vars.DB_PORT }}" \
             -e DB_DATABASE="${{ vars.DB_DATABASE }}" \
