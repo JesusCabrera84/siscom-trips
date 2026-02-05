@@ -109,10 +109,12 @@ pub async fn process_message(pool: &sqlx::Pool<Postgres>, payload: &[u8]) -> any
         }
     } else {
         None
-    }.unwrap_or_else(|| {
+    }
+    .unwrap_or_else(|| {
         if let Some(metadata) = message.metadata.as_ref() {
             if metadata.decoded_epoch > 0 {
-                return Utc.timestamp_millis_opt(metadata.decoded_epoch as i64)
+                return Utc
+                    .timestamp_millis_opt(metadata.decoded_epoch as i64)
                     .single()
                     .map(|t| t.naive_utc())
                     .unwrap_or_else(|| Utc::now().naive_utc());
@@ -121,14 +123,34 @@ pub async fn process_message(pool: &sqlx::Pool<Postgres>, payload: &[u8]) -> any
         Utc::now().naive_utc()
     });
 
-    let lat = message.data.get("LATITUD").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
-    let lon = message.data.get("LONGITUD").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
-    let speed = message.data.get("SPEED").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
-    let odometer_meters = message.data.get("ODOMETER").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
-    let heading = message.data.get("COURSE").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+    let lat = message
+        .data
+        .get("LATITUD")
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(0.0);
+    let lon = message
+        .data
+        .get("LONGITUD")
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(0.0);
+    let speed = message
+        .data
+        .get("SPEED")
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(0.0);
+    let odometer_meters = message
+        .data
+        .get("ODOMETER")
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(0.0);
+    let heading = message
+        .data
+        .get("COURSE")
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(0.0);
 
     let alert_type = message.data.get("ALERT").map(|s| s.as_str());
-    
+
     // 3. Start Transaction
     let mut tx = pool.begin().await?;
 
@@ -164,7 +186,10 @@ pub async fn process_message(pool: &sqlx::Pool<Postgres>, payload: &[u8]) -> any
 
     // 5. Determine Destination and Process
     let destination = determine_destination(alert_type, is_trip_active);
-    debug!("Message destination for {}: {:?}", device_id_str, destination);
+    debug!(
+        "Message destination for {}: {:?}",
+        device_id_str, destination
+    );
 
     match destination {
         MessageDestination::NewTrip => {
@@ -201,7 +226,9 @@ pub async fn process_message(pool: &sqlx::Pool<Postgres>, payload: &[u8]) -> any
                 .bind(lon)
                 .bind("ignition_on")
                 .bind(
-                    message.data.get("RAW_CODE")
+                    message
+                        .data
+                        .get("RAW_CODE")
                         .and_then(|s| s.parse::<i32>().ok()),
                 )
                 .bind(1i16)
@@ -242,7 +269,9 @@ pub async fn process_message(pool: &sqlx::Pool<Postgres>, payload: &[u8]) -> any
                     .bind(lon)
                     .bind("ignition_off")
                     .bind(
-                        message.data.get("RAW_CODE")
+                        message
+                            .data
+                            .get("RAW_CODE")
                             .and_then(|s| s.parse::<i32>().ok()),
                     )
                     .bind(1i16)
@@ -251,7 +280,10 @@ pub async fn process_message(pool: &sqlx::Pool<Postgres>, payload: &[u8]) -> any
                     .execute(&mut *tx)
                     .await?;
             } else {
-                error!("Active trip state without trip_id for end trip: {}", device_id_str);
+                error!(
+                    "Active trip state without trip_id for end trip: {}",
+                    device_id_str
+                );
             }
         }
         MessageDestination::TripAlert => {
@@ -265,7 +297,9 @@ pub async fn process_message(pool: &sqlx::Pool<Postgres>, payload: &[u8]) -> any
                     .bind(lon)
                     .bind(alert_type.unwrap_or(""))
                     .bind(
-                        message.data.get("RAW_CODE")
+                        message
+                            .data
+                            .get("RAW_CODE")
                             .and_then(|s| s.parse::<i32>().ok()),
                     )
                     .bind(1i16)
@@ -274,7 +308,7 @@ pub async fn process_message(pool: &sqlx::Pool<Postgres>, payload: &[u8]) -> any
                     .execute(&mut *tx)
                     .await?;
             }
-            
+
             sqlx::query(queries::UPDATE_CURRENT_STATE_POINT)
                 .bind(&device_id_str)
                 .bind(timestamp)
@@ -339,7 +373,9 @@ pub async fn process_message(pool: &sqlx::Pool<Postgres>, payload: &[u8]) -> any
                 .bind(lon)
                 .bind(activity_type)
                 .bind(
-                    message.data.get("RAW_CODE")
+                    message
+                        .data
+                        .get("RAW_CODE")
                         .and_then(|s| s.parse::<i32>().ok()),
                 )
                 .bind(1i16)
@@ -360,7 +396,10 @@ pub async fn process_message(pool: &sqlx::Pool<Postgres>, payload: &[u8]) -> any
                 .await?;
         }
         MessageDestination::IgnoredIgnitionOn | MessageDestination::IgnoredIgnitionOff => {
-            info!("Ignored ignition event ({:?}) for device {}", destination, device_id_str);
+            info!(
+                "Ignored ignition event ({:?}) for device {}",
+                destination, device_id_str
+            );
             sqlx::query(queries::UPDATE_CURRENT_STATE_POINT)
                 .bind(&device_id_str)
                 .bind(timestamp)

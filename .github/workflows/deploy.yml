@@ -37,7 +37,7 @@ jobs:
     - name: Install system dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y cmake build-essential libssl-dev pkg-config
+        sudo apt-get install -y cmake build-essential libssl-dev pkg-config libsasl2-dev protobuf-compiler
         
     - name: Run tests
       run: cargo test --verbose

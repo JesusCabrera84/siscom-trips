@@ -10,7 +10,10 @@ use tracing::{error, info, warn};
 
 /// Starts the Kafka consumer with SASL/SCRAM authentication and a circuit breaker mechanism.
 pub async fn start_kafka_consumer(config: &AppConfig, pool: DbPool) -> anyhow::Result<()> {
-    info!("Initializing Kafka consumer for topic: {}", config.kafka_topic);
+    info!(
+        "Initializing Kafka consumer for topic: {}",
+        config.kafka_topic
+    );
 
     let mut client_config = ClientConfig::new();
     client_config
@@ -39,8 +42,7 @@ pub async fn start_kafka_consumer(config: &AppConfig, pool: DbPool) -> anyhow::R
         if consecutive_failures >= max_retries {
             warn!(
                 "Circuit breaker tripped ({} consecutive failures)! Sleeping for {} seconds...",
-                consecutive_failures,
-                config.kafka_circuit_breaker_cooldown
+                consecutive_failures, config.kafka_circuit_breaker_cooldown
             );
             tokio::time::sleep(cooldown_duration).await;
             consecutive_failures = 0;
@@ -62,18 +64,25 @@ pub async fn start_kafka_consumer(config: &AppConfig, pool: DbPool) -> anyhow::R
 
                 let pool_clone = pool.clone();
                 let payload_vec = payload.to_vec();
-                
+
                 // Process the message in a background task to not block the consumer loop
                 tokio::spawn(async move {
-                    if let Err(e) = message_processor::process_message(&pool_clone, &payload_vec).await {
+                    if let Err(e) =
+                        message_processor::process_message(&pool_clone, &payload_vec).await
+                    {
                         error!("Error processing message: {}", e);
                     }
                 });
             }
             Err(e) => {
-                error!("Kafka error: {}. Incrementing failure count ({} / {})", e, consecutive_failures + 1, max_retries);
+                error!(
+                    "Kafka error: {}. Incrementing failure count ({} / {})",
+                    e,
+                    consecutive_failures + 1,
+                    max_retries
+                );
                 consecutive_failures += 1;
-                
+
                 // Small delay to prevent tight loop in case of minor network glitches
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }

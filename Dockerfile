@@ -9,10 +9,13 @@ RUN apt-get update && apt-get install -y \
     build-essential \
     pkg-config \
     libssl-dev \
+    libsasl2-dev \
+    protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy manifest files
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock build.rs ./
+COPY siscom.proto ./
 
 # Build dependencies (cached layer)
 RUN mkdir src && echo "fn main() {}" > src/main.rs
@@ -35,6 +38,7 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     libssl3 \
+    libsasl2-2 \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy binary from builder stage
@@ -51,6 +55,6 @@ USER siscom
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-  CMD pidof siscom-trips || exit 1
+    CMD pidof siscom-trips || exit 1
 
 CMD ["siscom-trips"]
