@@ -328,7 +328,6 @@ pub async fn process_message(pool: &sqlx::Pool<Postgres>, payload: &[u8]) -> any
                     .bind(timestamp)
                     .bind(lat)
                     .bind(lon)
-                    .bind(lon)
                     .bind(speed)
                     .bind(heading)
                     .bind(odometer_meters)
