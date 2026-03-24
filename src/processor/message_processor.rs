@@ -89,7 +89,12 @@ pub async fn process_message(pool: &sqlx::Pool<Postgres>, payload: &[u8]) -> any
     // 2. Extract Data
     let device_id_str = message.data.get("DEVICE_ID").cloned().unwrap_or_default();
     if device_id_str.is_empty() {
-        warn!("Message missing DEVICE_ID in data map, skipping");
+        warn!(
+            "Message missing DEVICE_ID in data map, skipping. uuid={} data={:?} metadata={:?}",
+            message.uuid,
+            message.data,
+            message.metadata
+        );
         return Ok(());
     }
 
