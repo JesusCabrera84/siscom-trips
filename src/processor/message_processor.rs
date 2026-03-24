@@ -91,9 +91,7 @@ pub async fn process_message(pool: &sqlx::Pool<Postgres>, payload: &[u8]) -> any
     if device_id_str.is_empty() {
         warn!(
             "Message missing DEVICE_ID in data map, skipping. uuid={} data={:?} metadata={:?}",
-            message.uuid,
-            message.data,
-            message.metadata
+            message.uuid, message.data, message.metadata
         );
         return Ok(());
     }
